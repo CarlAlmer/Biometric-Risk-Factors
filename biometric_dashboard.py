@@ -1,4 +1,5 @@
 import hashlib
+import os
 import sqlite3
 from datetime import datetime
 
@@ -7,19 +8,11 @@ import streamlit as st
 
 
 # ============================================================
-# PAGE CONFIG
+# PATH + DATABASE
 # ============================================================
-st.set_page_config(
-    page_title="Firefighter Biometric Risk Dashboard",
-    page_icon="🚒",
-    layout="wide",
-)
-
-
-# ============================================================
-# DATABASE SETUP
-# ============================================================
-DB_PATH = "biometric.db"
+_same_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "biometric.db")
+_up_one = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../data/biometric.db")
+DB_PATH = _same_dir if os.path.exists(_same_dir) else _up_one
 
 
 def connect_db():
@@ -71,6 +64,16 @@ create_tables()
 
 
 # ============================================================
+# PAGE CONFIG
+# ============================================================
+st.set_page_config(
+    page_title="Firefighter Biometric Risk Dashboard",
+    page_icon="🚒",
+    layout="wide",
+)
+
+
+# ============================================================
 # PASSWORD PROTECTION
 # ============================================================
 if "password" in st.secrets:
@@ -81,7 +84,7 @@ if "password" in st.secrets:
 
 
 # ============================================================
-# STYLING
+# CSS
 # ============================================================
 st.markdown(
     """
@@ -109,6 +112,13 @@ div[data-testid="metric-container"] {
     padding: 0.75rem 1rem;
     background-color: #FBEEEE;
 }
+.stTabs [data-baseweb="tab-highlight"] {
+    background-color: #C8102E !important;
+}
+.stTabs [aria-selected="true"] {
+    color: #C8102E !important;
+    font-weight: 700;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -133,11 +143,38 @@ RISK_RULES = {
 
 
 # ============================================================
-# CLEANING FUNCTIONS
+# FILE READING + CLEANING
 # ============================================================
 def file_hash(uploaded_file):
+    uploaded_file.seek(0)
     file_bytes = uploaded_file.getvalue()
+    uploaded_file.seek(0)
     return hashlib.md5(file_bytes).hexdigest()
+
+
+def read_uploaded_file(uploaded_file):
+    """
+    Reads CSV or Excel files.
+
+    Many department files have a title row first, then the real column names
+    on the second row, so Excel files are read with header=1.
+    """
+    uploaded_file.seek(0)
+
+    if uploaded_file.name.lower().endswith(".csv"):
+        return pd.read_csv(uploaded_file)
+
+    try:
+        return pd.read_excel(uploaded_file, header=1, engine="openpyxl")
+    except ImportError:
+        st.error(
+            "Missing package: openpyxl. Add openpyxl to requirements.txt, "
+            "push to GitHub, and redeploy the Streamlit app."
+        )
+        st.stop()
+    except Exception as e:
+        st.error(f"Could not read Excel file: {e}")
+        st.stop()
 
 
 def clean_column_names(df):
@@ -151,22 +188,28 @@ def clean_column_names(df):
         .str.upper()
         .str.replace(r"^\d+\s*", "", regex=True)
         .str.replace(" ", "_")
+        .str.replace(".", "", regex=False)
     )
 
     rename_map = {
         "DATE_OF_BIRTH": "DOB",
         "BIRTH_DATE": "DOB",
+        "BIRTHDATE": "DOB",
+        "AGE": "Age",
         "BP": "BP",
         "BLOOD_PRESSURE": "BP",
+        "BLOOD_PRESSURE_READING": "BP",
         "TOTAL_CHOLESTEROL": "TC",
         "CHOLESTEROL": "TC",
         "GLUCOSE": "GLU",
         "WAIST_CIRCUMFERENCE": "WAIST",
         "TC/HDL": "RTO",
+        "TC_HDL": "RTO",
         "RATIO": "RTO",
     }
 
     df = df.rename(columns=rename_map)
+
     return df
 
 
@@ -182,34 +225,44 @@ def split_blood_pressure(df):
 
 
 def clean_biometric_file(uploaded_file, department, year):
-    if uploaded_file.name.endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
-    else:
-        df = pd.read_excel(uploaded_file)
+    df = read_uploaded_file(uploaded_file)
 
     df = clean_column_names(df)
     df = split_blood_pressure(df)
 
-    keep_cols = ["DOB", "Age", "BMI", "WAIST", "TC", "HDL", "RTO", "GLU", "SYS", "DIA"]
-    existing_cols = [c for c in keep_cols if c in df.columns]
+    keep_cols = [
+        "DOB",
+        "Age",
+        "BMI",
+        "WAIST",
+        "TC",
+        "HDL",
+        "RTO",
+        "GLU",
+        "SYS",
+        "DIA",
+    ]
+
+    existing_cols = [col for col in keep_cols if col in df.columns]
     df = df[existing_cols].copy()
-
-    numeric_cols = ["Age", "BMI", "WAIST", "TC", "HDL", "RTO", "GLU", "SYS", "DIA"]
-
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    if "DOB" in df.columns:
-        df["DOB"] = pd.to_datetime(df["DOB"], errors="coerce")
-        if "Age" not in df.columns or df["Age"].isna().all():
-            today = pd.Timestamp.today()
-            df["Age"] = ((today - df["DOB"]).dt.days / 365.25).round(1)
-        df["DOB"] = df["DOB"].dt.strftime("%Y-%m-%d")
 
     for col in keep_cols:
         if col not in df.columns:
             df[col] = None
+
+    numeric_cols = ["Age", "BMI", "WAIST", "TC", "HDL", "RTO", "GLU", "SYS", "DIA"]
+
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "DOB" in df.columns:
+        df["DOB"] = pd.to_datetime(df["DOB"], errors="coerce")
+
+        if df["Age"].isna().all():
+            today = pd.Timestamp.today()
+            df["Age"] = ((today - df["DOB"]).dt.days / 365.25).round(1)
+
+        df["DOB"] = df["DOB"].dt.strftime("%Y-%m-%d")
 
     df["department"] = department
     df["year"] = int(year)
@@ -218,8 +271,21 @@ def clean_biometric_file(uploaded_file, department, year):
     df["uploaded_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     final_cols = [
-        "department", "year", "DOB", "Age", "BMI", "WAIST", "TC", "HDL",
-        "RTO", "GLU", "SYS", "DIA", "upload_filename", "upload_hash", "uploaded_at"
+        "department",
+        "year",
+        "DOB",
+        "Age",
+        "BMI",
+        "WAIST",
+        "TC",
+        "HDL",
+        "RTO",
+        "GLU",
+        "SYS",
+        "DIA",
+        "upload_filename",
+        "upload_hash",
+        "uploaded_at",
     ]
 
     return df[final_cols]
@@ -230,9 +296,15 @@ def clean_biometric_file(uploaded_file, department, year):
 # ============================================================
 def upload_already_exists(upload_hash):
     conn = connect_db()
-    query = "SELECT COUNT(*) FROM data_sources WHERE upload_hash = ?"
-    count = pd.read_sql_query(query, conn, params=(upload_hash,)).iloc[0, 0]
+
+    try:
+        query = "SELECT COUNT(*) FROM data_sources WHERE upload_hash = ?"
+        count = pd.read_sql_query(query, conn, params=(upload_hash,)).iloc[0, 0]
+    except Exception:
+        count = 0
+
     conn.close()
+
     return count > 0
 
 
@@ -258,7 +330,12 @@ def save_to_database(df, department, year, filename, upload_hash):
 @st.cache_data
 def load_biometric_data():
     conn = connect_db()
-    df = pd.read_sql_query("SELECT * FROM biometric_data", conn)
+
+    try:
+        df = pd.read_sql_query("SELECT * FROM biometric_data", conn)
+    except Exception:
+        df = pd.DataFrame()
+
     conn.close()
 
     for col in METRIC_COLUMNS + ["Age", "year"]:
@@ -271,13 +348,22 @@ def load_biometric_data():
 @st.cache_data
 def load_sources():
     conn = connect_db()
-    df = pd.read_sql_query("SELECT * FROM data_sources ORDER BY uploaded_at DESC", conn)
+
+    try:
+        df = pd.read_sql_query(
+            "SELECT * FROM data_sources ORDER BY uploaded_at DESC",
+            conn
+        )
+    except Exception:
+        df = pd.DataFrame()
+
     conn.close()
+
     return df
 
 
 # ============================================================
-# ANALYSIS FUNCTIONS
+# DASHBOARD FUNCTIONS
 # ============================================================
 def add_risk_flags(df):
     out = df.copy()
@@ -309,8 +395,8 @@ def risk_percent(df, metric):
 
     if direction == "high":
         return (values >= cutoff).mean() * 100
-    else:
-        return (values < cutoff).mean() * 100
+
+    return (values < cutoff).mean() * 100
 
 
 def summarize_by_department(df):
@@ -341,15 +427,37 @@ def summarize_by_department(df):
     return summary
 
 
+def apply_filters(df, departments, years, age_range):
+    out = df.copy()
+
+    if departments:
+        out = out[out["department"].isin(departments)]
+
+    if years:
+        out = out[out["year"].isin(years)]
+
+    if "Age" in out.columns and age_range:
+        out = out[
+            (out["Age"] >= age_range[0]) &
+            (out["Age"] <= age_range[1])
+        ]
+
+    return out
+
+
 def style_risk(val):
     try:
         v = float(val)
+
         if v >= 50:
             return "color: #C8102E; font-weight: 700"
+
         if v >= 25:
             return "color: #B36B00; font-weight: 700"
+
     except Exception:
         pass
+
     return ""
 
 
@@ -371,7 +479,14 @@ st.markdown(
 # TABS
 # ============================================================
 tab_upload, tab_overview, tab_departments, tab_risk, tab_records, tab_sources = st.tabs(
-    ["Upload Data", "Overview", "Department Comparison", "Risk Factors", "Raw Records", "Data Sources"]
+    [
+        "Upload Data",
+        "Overview",
+        "Department Comparison",
+        "Risk Factors",
+        "Raw Records",
+        "Data Sources",
+    ]
 )
 
 
@@ -382,29 +497,43 @@ with tab_upload:
     st.header("Upload New Department Data")
 
     st.info(
-        "Upload an Excel or CSV file. The app will clean the file, preview it, "
-        "and then save it into the database."
+        "Upload an Excel or CSV file. The app will read the file, clean it, "
+        "show a preview, and then save the cleaned data to the database."
     )
 
     uploaded_file = st.file_uploader(
-        "Upload department file",
+        "Upload department biometric file",
         type=["xlsx", "xls", "csv"]
     )
 
     department = st.text_input("Department name")
-    year = st.number_input("Year", min_value=2000, max_value=2100, value=datetime.now().year)
+
+    year = st.number_input(
+        "Year",
+        min_value=2000,
+        max_value=2100,
+        value=datetime.now().year,
+        step=1
+    )
 
     if uploaded_file is not None:
         if not department:
             st.warning("Enter a department name before saving.")
         else:
-            cleaned_df = clean_biometric_file(uploaded_file, department, year)
             upload_hash = file_hash(uploaded_file)
+            cleaned_df = clean_biometric_file(uploaded_file, department, year)
 
             st.subheader("Cleaned Preview")
             st.dataframe(cleaned_df.head(50), use_container_width=True, hide_index=True)
 
             st.write(f"Records found: **{len(cleaned_df)}**")
+
+            missing_all = cleaned_df[METRIC_COLUMNS].isna().all(axis=1).sum()
+            if missing_all > 0:
+                st.warning(
+                    f"{missing_all} rows appear to have no biometric values. "
+                    "You may want to check the file before saving."
+                )
 
             if upload_already_exists(upload_hash):
                 st.error("This exact file has already been uploaded.")
@@ -424,7 +553,7 @@ with tab_upload:
 
 
 # ============================================================
-# LOAD DATA FOR DASHBOARD
+# LOAD DATA
 # ============================================================
 data = load_biometric_data()
 
@@ -442,23 +571,21 @@ if not data.empty:
     if "Age" in data.columns and data["Age"].notna().any():
         min_age = int(data["Age"].min())
         max_age = int(data["Age"].max())
-        selected_age = st.sidebar.slider("Age range", min_age, max_age, (min_age, max_age))
+        selected_age = st.sidebar.slider(
+            "Age range",
+            min_age,
+            max_age,
+            (min_age, max_age)
+        )
     else:
         selected_age = None
 
-    filtered = data.copy()
-
-    if selected_departments:
-        filtered = filtered[filtered["department"].isin(selected_departments)]
-
-    if selected_years:
-        filtered = filtered[filtered["year"].isin(selected_years)]
-
-    if selected_age:
-        filtered = filtered[
-            (filtered["Age"] >= selected_age[0]) &
-            (filtered["Age"] <= selected_age[1])
-        ]
+    filtered = apply_filters(
+        data,
+        selected_departments,
+        selected_years,
+        selected_age
+    )
 
 else:
     filtered = pd.DataFrame()
@@ -477,33 +604,49 @@ with tab_overview:
 
         c1.metric("Records", f"{len(filtered):,}")
         c2.metric("Departments", filtered["department"].nunique())
-        c3.metric("Avg Age", f"{filtered['Age'].mean():.1f}")
-        c4.metric("Avg Risk Factors", f"{filtered['risk_factor_count'].mean():.2f}")
+
+        avg_age = filtered["Age"].mean()
+        avg_risk = filtered["risk_factor_count"].mean()
+
+        c3.metric("Avg Age", f"{avg_age:.1f}" if pd.notna(avg_age) else "—")
+        c4.metric("Avg Risk Factors", f"{avg_risk:.2f}" if pd.notna(avg_risk) else "—")
 
         c5, c6, c7, c8 = st.columns(4)
 
         c5.metric("Avg BMI", f"{filtered['BMI'].mean():.1f}")
         c6.metric("Avg Glucose", f"{filtered['GLU'].mean():.1f}")
         c7.metric("Avg Total Chol.", f"{filtered['TC'].mean():.1f}")
-        c8.metric("Avg BP", f"{filtered['SYS'].mean():.0f}/{filtered['DIA'].mean():.0f}")
+
+        if {"SYS", "DIA"}.issubset(filtered.columns):
+            avg_sys = filtered["SYS"].mean()
+            avg_dia = filtered["DIA"].mean()
+            if pd.notna(avg_sys) and pd.notna(avg_dia):
+                c8.metric("Avg BP", f"{avg_sys:.0f}/{avg_dia:.0f}")
+            else:
+                c8.metric("Avg BP", "—")
+        else:
+            c8.metric("Avg BP", "—")
 
         st.divider()
 
-        metric = st.selectbox(
-            "Choose a metric",
-            [m for m in METRIC_COLUMNS if m in filtered.columns]
-        )
+        st.subheader("Metric Distributions")
 
-        chart_df = filtered[[metric]].dropna()
+        available_metrics = [m for m in METRIC_COLUMNS if m in filtered.columns]
 
-        if not chart_df.empty:
-            st.bar_chart(chart_df[metric].value_counts().sort_index())
+        if available_metrics:
+            metric = st.selectbox("Choose a metric", available_metrics)
+            chart_df = filtered[[metric]].dropna()
+
+            if not chart_df.empty:
+                st.bar_chart(chart_df[metric].value_counts().sort_index())
+            else:
+                st.info("No values available for this metric.")
         else:
-            st.info("No values available for this metric.")
+            st.info("No metric columns available.")
 
 
 # ============================================================
-# DEPARTMENT TAB
+# DEPARTMENT COMPARISON TAB
 # ============================================================
 with tab_departments:
     st.header("Department Comparison")
@@ -513,34 +656,70 @@ with tab_departments:
     else:
         summary = summarize_by_department(filtered)
 
-        chart_metric = st.selectbox(
-            "Compare departments by",
-            [
-                "Avg_Risk_Factors", "Avg_BMI", "Avg_WAIST", "Avg_TC",
-                "Avg_HDL", "Avg_RTO", "Avg_GLU", "Avg_SYS", "Avg_DIA"
-            ]
-        )
+        if summary.empty:
+            st.warning("No summary data available.")
+        else:
+            chart_metric = st.selectbox(
+                "Compare departments by",
+                [
+                    "Avg_Risk_Factors",
+                    "Avg_BMI",
+                    "Avg_WAIST",
+                    "Avg_TC",
+                    "Avg_HDL",
+                    "Avg_RTO",
+                    "Avg_GLU",
+                    "Avg_SYS",
+                    "Avg_DIA",
+                ]
+            )
 
-        chart_data = summary.pivot_table(
-            index="department",
-            columns="year",
-            values=chart_metric,
-            aggfunc="mean"
-        )
+            chart_data = summary.pivot_table(
+                index="department",
+                columns="year",
+                values=chart_metric,
+                aggfunc="mean"
+            )
 
-        st.bar_chart(chart_data)
+            st.bar_chart(chart_data)
 
-        st.divider()
+            st.divider()
 
-        st.dataframe(
-            summary,
-            use_container_width=True,
-            hide_index=True
-        )
+            format_cols = {
+                "Avg_Age": "{:.1f}",
+                "Avg_BMI": "{:.1f}",
+                "Avg_WAIST": "{:.1f}",
+                "Avg_TC": "{:.1f}",
+                "Avg_HDL": "{:.1f}",
+                "Avg_RTO": "{:.2f}",
+                "Avg_GLU": "{:.1f}",
+                "Avg_SYS": "{:.1f}",
+                "Avg_DIA": "{:.1f}",
+                "Avg_Risk_Factors": "{:.2f}",
+                "Pct_BMI_Risk": "{:.1f}%",
+                "Pct_WAIST_Risk": "{:.1f}%",
+                "Pct_TC_Risk": "{:.1f}%",
+                "Pct_HDL_Risk": "{:.1f}%",
+                "Pct_RTO_Risk": "{:.1f}%",
+                "Pct_GLU_Risk": "{:.1f}%",
+                "Pct_SYS_Risk": "{:.1f}%",
+                "Pct_DIA_Risk": "{:.1f}%",
+            }
+
+            pct_cols = [c for c in summary.columns if c.startswith("Pct_")]
+
+            st.dataframe(
+                summary.style.format(format_cols, na_rep="—").map(
+                    style_risk,
+                    subset=pct_cols
+                ),
+                use_container_width=True,
+                hide_index=True
+            )
 
 
 # ============================================================
-# RISK TAB
+# RISK FACTORS TAB
 # ============================================================
 with tab_risk:
     st.header("Risk Factors")
@@ -566,21 +745,29 @@ with tab_risk:
 
         risk_df = pd.DataFrame(risk_rows)
 
-        st.dataframe(
-            risk_df.style.format({"Percent Flagged": "{:.1f}%"}).map(
-                style_risk,
-                subset=["Percent Flagged"]
-            ),
-            use_container_width=True,
-            hide_index=True
-        )
+        if not risk_df.empty:
+            st.dataframe(
+                risk_df.style.format(
+                    {"Percent Flagged": "{:.1f}%"},
+                    na_rep="—"
+                ).map(
+                    style_risk,
+                    subset=["Percent Flagged"]
+                ),
+                use_container_width=True,
+                hide_index=True
+            )
 
-        st.bar_chart(risk_df.set_index("Metric")["Percent Flagged"])
+            st.bar_chart(risk_df.set_index("Metric")["Percent Flagged"])
 
         st.divider()
 
         st.subheader("Risk Factor Count by Record")
-        st.bar_chart(filtered["risk_factor_count"].value_counts().sort_index())
+
+        if "risk_factor_count" in filtered.columns:
+            st.bar_chart(filtered["risk_factor_count"].value_counts().sort_index())
+        else:
+            st.info("Risk factor counts are not available.")
 
 
 # ============================================================
@@ -588,13 +775,27 @@ with tab_risk:
 # ============================================================
 with tab_records:
     st.header("Raw Records")
+    st.caption("Use this for checking cleaned records. Consider hiding DOB before sharing publicly.")
 
     if filtered.empty:
         st.warning("No records available.")
     else:
         show_cols = [
-            "id", "department", "year", "Age", "BMI", "WAIST", "TC", "HDL",
-            "RTO", "GLU", "SYS", "DIA", "risk_factor_count"
+            "id",
+            "department",
+            "year",
+            "Age",
+            "BMI",
+            "WAIST",
+            "TC",
+            "HDL",
+            "RTO",
+            "GLU",
+            "SYS",
+            "DIA",
+            "risk_factor_count",
+            "upload_filename",
+            "uploaded_at",
         ]
 
         show_cols = [c for c in show_cols if c in filtered.columns]
@@ -605,7 +806,11 @@ with tab_records:
 
         if search_department:
             records = records[
-                records["department"].str.contains(search_department, case=False, na=False)
+                records["department"].str.contains(
+                    search_department,
+                    case=False,
+                    na=False
+                )
             ]
 
         st.dataframe(records[show_cols], use_container_width=True, hide_index=True)
